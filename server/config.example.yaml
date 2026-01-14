@@ -1,0 +1,12 @@
+server:
+  host: "0.0.0.0"
+  port: 8765  # WebSocket Port (Browser connects here)
+  # auth_token: "my-secret-token" # Uncomment to enable authentication
+  ssl: false  # Set to true if using cert.pem/key.pem (Place in client/ folder)
+
+client:
+  overlay_url: "http://homeassistant.local:8123/lovelace/0"
+
+logging:
+  level: "INFO"
+  file: "logs/pwa-voice-assistant.log"

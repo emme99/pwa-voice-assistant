@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  hybrid-satellite:
+    image: pwa-voice-assistant-image
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: pwa-voice-assistant
+    ports:
+      - "8765:8765"  # WebSocket (Client)
+      - "10400:10400" # Wyoming Protocol (Home Assistant Satellite)
+    volumes:
+      - ./server/config.yaml:/app/server/config.yaml
+      - ./server/logs:/app/server/logs
+      # Mount certificates if you generate them
+      - ./client/cert.pem:/app/client/cert.pem
+      - ./client/key.pem:/app/client/key.pem
+    restart: unless-stopped
+    networks:
+      - pwa-voice-assistant-net
+
+networks:
+  pwa-voice-assistant-net:
+    driver: bridge
