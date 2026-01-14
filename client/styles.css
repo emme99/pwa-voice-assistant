@@ -638,3 +638,70 @@ body.overlay-mode {
 .hidden {
     display: none !important;
 }
+
+/* Toast Notifications */
+.toast-container {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    pointer-events: none;
+    width: max-content;
+    max-width: 90vw;
+}
+
+.toast {
+    background: rgba(20, 25, 45, 0.95);
+    color: var(--text-primary);
+    padding: 12px 24px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(10px);
+    font-size: 0.95rem;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    animation: slideUp 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: auto;
+}
+
+.toast.info {
+    border-left: 4px solid var(--accent-primary);
+}
+
+.toast.success {
+    border-left: 4px solid var(--accent-success);
+}
+
+.toast.warning {
+    border-left: 4px solid var(--accent-warning);
+}
+
+.toast.error {
+    border-left: 4px solid var(--accent-error);
+}
+
+@keyframes slideUp {
+    from {
+        transform: translateY(100%);
+        opacity: 0;
+    }
+
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+@keyframes fadeOut {
+    to {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+}

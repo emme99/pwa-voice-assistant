@@ -92,3 +92,19 @@ To add the PWA as a dashboard card (via Webpage card/iframe) over HTTP, you must
 
 ## License
 MIT License
+
+## 🔋 Battery Optimization (Android)
+To prevent the app from sleeping in the background (which stops wake word detection):
+1. Go to **Settings > Apps > Chrome** (or your browser).
+2. Tap **Battery**.
+3. Set to **Unrestricted** (or "Don't optimize").
+4. (Optional) Lock the app in the "Refent Apps" view so it isn't cleared by memory management.
+
+## 🛠 Troubleshooting
+- **Connection Lost**: The yellow/red status dot indicates a WebSocket issue. The app automatically attempts to reconnect (with exponential backoff).
+- **Microphone**: If "Inactive" or "Denied", ensure the site is accessed via HTTPS (or localhost) and permissions are granted. The app will prompt you to retry if denied.
+- **Wake Word Stops working**:
+    - If on Android, check **Battery Optimization** settings above.
+    - Check the **Debug Log** (toggle in settings overlay) for errors.
+    - Ensure the WebSocket server is running.
+

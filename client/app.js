@@ -5,7 +5,7 @@
 
 // Configuration
 const CONFIG = {
-    // Dynamically determine WebSocket URL based on current location
+    // Dynamically determine WebSocket URL based on current location if not stored
     wsUrl: localStorage.getItem('wsUrl') || 
            ((window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host),
     wakeWord: localStorage.getItem('wakeWord') || 'alexa_v0.1',
@@ -13,13 +13,14 @@ const CONFIG = {
     overlayUrl: localStorage.getItem('overlayUrl') || '',
     sampleRate: 16000,
     ttsSampleRate: 22050,
-    channels: 1
+    channels: 1,
+    pingIntervalMs: 20000,
+    pongTimeoutMs: 5000
 };
 
 // ONNX Runtime Web Configuration
 if (window.ort) {
-    ort.env.wasm.wasmPaths = '/libs/'; // Absolute path fixes 'libs/libs' issue
-    // Disable multi-threading for max compatibility if needed, but try default first
+    ort.env.wasm.wasmPaths = '/libs/'; 
     // ort.env.wasm.numThreads = 1; 
 }
 
@@ -32,18 +33,23 @@ const STATE = {
     isActive: false,
     isListening: false,
     reconnectAttempts: 0,
-    maxReconnectAttempts: 5,
+    maxReconnectAttempts: 10, // Increased cap
+    reconnectTimer: null,
+    pingInterval: null,
+    pongTimeout: null,
+    isReconnecting: false,
     onnxSessions: {
         mel: null,
         embedding: null,
         wakeWord: null
     },
     buffers: {
-        mel: [], // Grows/splices dynamically
-        emb: new Array(16).fill(0).map(() => new Float32Array(96).fill(0)) // Fixed ring buffer
+        mel: [], 
+        emb: new Array(16).fill(0).map(() => new Float32Array(96).fill(0)) 
     },
     lastError: null,
-    isInferencing: false
+    isInferencing: false,
+    silenceTimer: null
 };
 
 // DOM Elements
@@ -61,8 +67,6 @@ const elements = {
     micVisualizer: document.getElementById('mic-visualizer'),
     debugLog: document.getElementById('debug-log'),
     wsUrlInput: document.getElementById('ws-url'),
-    wakeWordSelect: document.getElementById('wake-word-select'),
-    wakeWordSelect: document.getElementById('wake-word-select'),
     wakeWordSelect: document.getElementById('wake-word-select'),
     authTokenInput: document.getElementById('auth-token'),
     overlayUrlInput: document.getElementById('overlay-url-input'),
@@ -82,11 +86,9 @@ async function init() {
     log('Application starting...', 'info');
     
     // Load saved settings
-    elements.wsUrlInput.value = CONFIG.wsUrl;
-    elements.wakeWordSelect.value = CONFIG.wakeWord;
-    elements.wsUrlInput.value = CONFIG.wsUrl;
-    elements.wakeWordSelect.value = CONFIG.wakeWord;
-    elements.authTokenInput.value = CONFIG.authToken;
+    if (elements.wsUrlInput) elements.wsUrlInput.value = CONFIG.wsUrl;
+    if (elements.wakeWordSelect) elements.wakeWordSelect.value = CONFIG.wakeWord;
+    if (elements.authTokenInput) elements.authTokenInput.value = CONFIG.authToken;
     if (elements.overlayUrlInput) elements.overlayUrlInput.value = CONFIG.overlayUrl;
 
     // Set initial iframe URL if configured locally
@@ -96,13 +98,8 @@ async function init() {
     }
     
     // Setup event listeners
-    // Setup event listeners
-    if (elements.activateBtn) {
-        elements.activateBtn.addEventListener('click', toggleActivation);
-    }
-    if (elements.activateFab) {
-        elements.activateFab.addEventListener('click', toggleActivation);
-    }
+    if (elements.activateBtn) elements.activateBtn.addEventListener('click', toggleActivation);
+    if (elements.activateFab) elements.activateFab.addEventListener('click', toggleActivation);
     
     if (elements.settingsBtn) elements.settingsBtn.addEventListener('click', toggleSettings);
     if (elements.saveSettings) elements.saveSettings.addEventListener('click', saveSettings);
@@ -122,8 +119,19 @@ async function init() {
     }
 
     // Auto-connect to WebSocket for config/status
-    connectWebSocket().catch(err => log(`Auto-connect failed: ${err.message}`, 'warning'));
+    connectWebSocket();
     
+    // Network status listeners
+    window.addEventListener('online', () => {
+        log('Network online, attempting reconnect...', 'info');
+        connectWebSocket();
+    });
+    window.addEventListener('offline', () => {
+        log('Network offline', 'warning');
+        updateStatus('ws-status', 'disconnected', 'Offline');
+        stopKeepAlive();
+    });
+
     log('Application initialized', 'success');
 }
 
@@ -150,14 +158,18 @@ async function activate() {
         
         // Ensure WebSocket is connected
         if (!STATE.ws || STATE.ws.readyState !== WebSocket.OPEN) {
+             log('WebSocket not connecting, attempting to connect first...', 'warning');
              await connectWebSocket();
         }
         
         // Request microphone access
-        await requestMicrophone();
+        const micSuccess = await requestMicrophone();
+        if (!micSuccess) return; // Exit if mic failed
         
-        // Load wake word model
-        await loadWakeWordModel();
+        // Load wake word model (if not already loaded)
+        if (!STATE.onnxSessions.wakeWord) {
+             await loadWakeWordModel();
+        }
         
         STATE.isActive = true;
         updateUI();
@@ -171,9 +183,11 @@ async function activate() {
         }
         
         log('Voice control activated', 'success');
+        if (window.showToast) window.showToast('Voice control activated', 'success');
         
     } catch (error) {
         log(`Activation failed: ${error.message}`, 'error');
+        if (window.showToast) window.showToast('Activation failed: ' + error.message, 'error');
         await deactivate();
     }
 }
@@ -194,16 +208,11 @@ async function deactivate() {
         STATE.mediaStream = null;
     }
     
+    // Do not close AudioContext completely if we want to reuse it, but strict cleanup is safer
     if (STATE.audioContext) {
         await STATE.audioContext.close();
         STATE.audioContext = null;
     }
-    
-    // Do not close WebSocket to keep config/overlay active
-    // if (STATE.ws) {
-    //    STATE.ws.close();
-    //    STATE.ws = null;
-    // }
     
     STATE.isActive = false;
     STATE.isListening = false;
@@ -219,6 +228,7 @@ async function deactivate() {
         elements.activateFab.classList.remove('listening');
     }
     
+    updateStatus('mic-status', 'inactive', 'Inactive');
     log('Voice control deactivated', 'info');
 }
 
@@ -227,17 +237,12 @@ async function deactivate() {
  */
 async function initAudioContext() {
     if (!STATE.audioContext) {
-        // Allow system default (usually 44100 or 48000) for best compatibility
         STATE.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-
         log(`Audio context initialized at ${STATE.audioContext.sampleRate}Hz`, 'info');
-        
-        console.log(`[DEBUG] AudioContext sample rate: ${STATE.audioContext.sampleRate} Hz`);
         
         if (STATE.audioContext.sampleRate !== 16000) {
              const msg = `Sample rate is ${STATE.audioContext.sampleRate}Hz. Resampling active (Robust).`;
              console.warn(msg);
-             // log(msg, 'warning'); // User knows this, hide to reduce noise
         }
     }
     
@@ -247,63 +252,113 @@ async function initAudioContext() {
 }
 
 /**
- * Connect to WebSocket server
+ * Connect to WebSocket server with Robust Reconnection
  */
 function connectWebSocket() {
-    return new Promise((resolve, reject) => {
-        log(`Connecting to ${CONFIG.wsUrl}...`, 'info');
-        
-        STATE.ws = new WebSocket(CONFIG.wsUrl);
-        
-        STATE.ws.onopen = async () => {
-            log('WebSocket connected', 'success');
-            updateStatus('ws-status', 'connected', 'Connected');
-            
-            // Authenticate if token is set
-            if (CONFIG.authToken) {
-                STATE.ws.send(JSON.stringify({
-                    type: 'auth',
-                    token: CONFIG.authToken
-                }));
-            }
+    if (STATE.ws && (STATE.ws.readyState === WebSocket.OPEN || STATE.ws.readyState === WebSocket.CONNECTING)) {
+        return; // Already connected or connecting
+    }
 
-            // Request initial status and config
-            STATE.ws.send(JSON.stringify({ type: 'status_request' }));
-            
-            STATE.reconnectAttempts = 0;
-            resolve();
-        };
+    // Clear any pending reconnects to avoid double-firing
+    if (STATE.reconnectTimer) clearTimeout(STATE.reconnectTimer);
+
+    log(`Connecting to ${CONFIG.wsUrl} (Attempt ${STATE.reconnectAttempts + 1})...`, 'info');
+    if (window.showToast && STATE.reconnectAttempts > 0) window.showToast('Reconnecting to server...', 'info', 2000);
+    
+    STATE.ws = new WebSocket(CONFIG.wsUrl);
+    
+    STATE.ws.onopen = async () => {
+        log('WebSocket connected', 'success');
+        updateStatus('ws-status', 'connected', 'Connected');
+        if (window.showToast) window.showToast('Connected to server', 'success');
         
-        STATE.ws.onclose = () => {
-            log('WebSocket disconnected', 'warning');
-            updateStatus('ws-status', 'disconnected', 'Disconnected');
-            
-            // Attempt reconnection (Infinite with backoff cap)
-            if (STATE.isActive) {
-                STATE.reconnectAttempts++;
-                const delay = Math.min(2000 * STATE.reconnectAttempts, 10000); // Cap at 10s
-                log(`Reconnecting in ${delay/1000}s...`, 'info');
-                setTimeout(() => connectWebSocket(), delay);
-            }
-        };
+        // Reset reconnect strategy
+        STATE.reconnectAttempts = 0;
         
-        STATE.ws.onerror = (error) => {
-            log(`WebSocket error: ${error}`, 'error');
-            reject(new Error('WebSocket connection failed'));
-        };
+        // Start Heartbeat
+        startKeepAlive();
         
-        STATE.ws.onmessage = handleWebSocketMessage;
+        // Authenticate if token is set
+        if (CONFIG.authToken) {
+            STATE.ws.send(JSON.stringify({ type: 'auth', token: CONFIG.authToken }));
+        }
+
+        // Request initial status and config
+        STATE.ws.send(JSON.stringify({ type: 'status_request' }));
+    };
+    
+    STATE.ws.onclose = (event) => {
+        updateStatus('ws-status', 'disconnected', 'Disconnected');
+        stopKeepAlive();
         
-        // Timeout after 5 seconds
-        setTimeout(() => {
-            if (STATE.ws.readyState !== WebSocket.OPEN) {
-                reject(new Error('Connection timeout'));
-            }
-        }, 5000);
-    });
+        if (event.wasClean) {
+            log(`WebSocket closed cleanly`, 'info');
+        } else {
+            log(`WebSocket disconnected unexpectedly`, 'warning');
+            scheduleReconnect();
+        }
+    };
+    
+    STATE.ws.onerror = (error) => {
+        log('WebSocket error occurred', 'error');
+        // onerror is usually followed by onclose, so we handle reconnect there
+        // unless it fails to connect at all in the beginning
+    };
+    
+    STATE.ws.onmessage = handleWebSocketMessage;
 }
 
+/**
+ * Exponential Backoff Reconnect Logic
+ */
+function scheduleReconnect() {
+    if (STATE.reconnectTimer) return; // Already scheduled
 
+    STATE.reconnectAttempts++;
+    
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s... capped at 30s
+    const backoff = Math.min(1000 * Math.pow(2, STATE.reconnectAttempts - 1), 30000);
+    
+    log(`Reconnecting in ${backoff/1000}s...`, 'info');
+    
+    STATE.reconnectTimer = setTimeout(() => {
+        STATE.reconnectTimer = null;
+        if (navigator.onLine) {
+            connectWebSocket();
+        } else {
+            log('Waiting for network...', 'warning');
+            // Check again in 5s if offline logic didn't catch it
+            STATE.reconnectTimer = setTimeout(() => scheduleReconnect, 5000); 
+        }
+    }, backoff);
+}
+
+/**
+ * Keep-Alive Heartbeat
+ */
+function startKeepAlive() {
+    stopKeepAlive(); // Ensure no duplicates
+    
+    STATE.pingInterval = setInterval(() => {
+        if (STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
+            // Send ping
+            STATE.ws.send(JSON.stringify({ type: 'ping' }));
+            
+            // Set timeout for pong
+            STATE.pongTimeout = setTimeout(() => {
+                log('Connection dead (no pong), terminating...', 'error');
+                if (STATE.ws) STATE.ws.close(); // This will trigger onclose -> reconnect
+            }, CONFIG.pongTimeoutMs);
+        }
+    }, CONFIG.pingIntervalMs);
+}
+
+function stopKeepAlive() {
+    if (STATE.pingInterval) clearInterval(STATE.pingInterval);
+    if (STATE.pongTimeout) clearTimeout(STATE.pongTimeout);
+    STATE.pingInterval = null;
+    STATE.pongTimeout = null;
+}
 
 /**
  * Handle incoming WebSocket messages
@@ -334,17 +389,21 @@ function handleControlMessage(message) {
             break;
         case 'auth_failed':
             log('Authentication failed', 'error');
+            if (window.showToast) window.showToast('Auth failed: Check token', 'error');
             deactivate();
             break;
         case 'pong':
-            // Keep-alive response
+            // Heartbeat response
+            if (STATE.pongTimeout) {
+                clearTimeout(STATE.pongTimeout);
+                STATE.pongTimeout = null;
+            }
             break;
         case 'config_audio':
             if (message.rate) {
                 STATE.currentTtsRate = message.rate;
-                log(`TTS Sample Rate set to ${message.rate}Hz`, 'info');
                 // Reset audio scheduling for new stream
-                STATE.nextAudioTime = STATE.audioContext.currentTime + 0.1;
+                if (STATE.audioContext) STATE.nextAudioTime = STATE.audioContext.currentTime + 0.1;
             }
             break;
         case 'status':
@@ -355,8 +414,7 @@ function handleControlMessage(message) {
             // Handle Config if present (Overlay URL)
             const targetUrl = CONFIG.overlayUrl || (message.config && message.config.overlay_url);
             if (targetUrl && elements.iframe) {
-                const currentSrc = elements.iframe.getAttribute('src');
-                if (elements.iframe.src !== targetUrl && elements.iframe.src === 'about:blank') {
+                 if (elements.iframe.src !== targetUrl && elements.iframe.src === 'about:blank') {
                     elements.iframe.src = targetUrl;
                     log(`Loaded overlay URL: ${targetUrl}`, 'info');
                 }
@@ -394,17 +452,10 @@ function handleVoiceEvent(message) {
         showBubble("Listening...");
     } else if (eventType === 4) { // STT_END
         if (data.text) showBubble(`"${data.text}"`);
-        // Stop listening (recording) as server has captured the speech
         if (STATE.isListening) {
              STATE.isListening = false;
              updateUI();
-             log('Speech captured, waiting for response...', 'info');
-             
-             // Reset buffers to ensure clean slate -- REMOVED
-             // Continuous inference handles this naturally. Resetting causes "blindness" and 0 probability.
-             // STATE.buffers.mel = [];
-             // STATE.buffers.emb = ...
-             
+             log('Speech captured', 'info');
              
              if (STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
                  STATE.ws.send(JSON.stringify({ type: 'stop' }));
@@ -423,6 +474,9 @@ function handleVoiceEvent(message) {
     }
 }
 
+/**
+ * UI Bubble Helpers
+ */
 function showBubble(text) {
     if (elements.bubbleText) {
         elements.bubbleText.textContent = text;
@@ -454,9 +508,15 @@ async function requestMicrophone() {
         
         const source = STATE.audioContext.createMediaStreamSource(STATE.mediaStream);
         await setupAudioProcessing(source);
+        return true;
         
     } catch (error) {
-        throw new Error(`Microphone access denied: ${error.message}`);
+        log(`Microphone access denied: ${error.message}`, 'error');
+        if (window.showToast) {
+            window.showToast('Microphone denied. Check browser settings.', 'error', 5000);
+        }
+        updateStatus('mic-status', 'inactive', 'Denied');
+        return false;
     }
 }
 
@@ -476,13 +536,12 @@ async function setupAudioProcessing(source) {
                 STATE.isInferencing = false;
             }
             
+            // If server is expecting audio (Listening state)
             if (STATE.isListening && STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
-                // Data from WakeWordProcessor is already downsampled to 16000Hz
-                const audioData = float32Data;
-
-                const int16Data = new Int16Array(audioData.length);
-                for (let i = 0; i < audioData.length; i++) {
-                    const s = Math.max(-1, Math.min(1, audioData[i]));
+                // Convert Float32 to Int16
+                const int16Data = new Int16Array(float32Data.length);
+                for (let i = 0; i < float32Data.length; i++) {
+                    const s = Math.max(-1, Math.min(1, float32Data[i]));
                     int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
                 STATE.ws.send(int16Data.buffer);
@@ -507,7 +566,6 @@ async function runWakeWordInference(float32Data) {
     
     try {
         // --- 1. Melspectrogram ---
-        // Input: Audio chunk [1, 1280]
         const melInputName = STATE.onnxSessions.mel.inputNames[0];
         const audioTensor = new ort.Tensor('float32', Float32Array.from(float32Data), [1, float32Data.length]);
         
@@ -527,7 +585,7 @@ async function runWakeWordInference(float32Data) {
 
         // Process while we have enough frames (sliding window)
         while (STATE.buffers.mel.length >= 76) {
-             // Flatten Mel Buffer: [76, 32] -> [1, 76, 32, 1]
+             // Flatten Mel Buffer
              const flatMel = new Float32Array(76 * 32);
              for (let i = 0; i < 76; i++) {
                  flatMel.set(STATE.buffers.mel[i], i * 32);
@@ -544,17 +602,16 @@ async function runWakeWordInference(float32Data) {
              STATE.buffers.emb.shift();
              STATE.buffers.emb.push(new Float32Array(embOutput));
              
-             // Flatten Embedding: [16, 96]
+             // --- 4. Wake Word ---
+             if (STATE.isListening) {
+                 STATE.buffers.mel.splice(0, 8);
+                 continue;
+             }
+             
+             // Flatten Embedding
              const flatEmb = new Float32Array(16 * 96);
              for (let i = 0; i < 16; i++) {
                  flatEmb.set(STATE.buffers.emb[i], i * 96);
-             }
-             
-             // --- 4. Wake Word ---
-             if (STATE.isListening) {
-                 // Skip classification if already listening, but perform stride to keep buffers fresh
-                 STATE.buffers.mel.splice(0, 8);
-                 continue;
              }
              
              const item = STATE.onnxSessions.wakeWord; 
@@ -569,14 +626,13 @@ async function runWakeWordInference(float32Data) {
                   triggerWakeWord();
              }
              
-             // Stride: Remove 8 frames from Mel buffer logic
+             // Stride: Remove 8 frames
              STATE.buffers.mel.splice(0, 8);
         }
 
     } catch (e) {
         if (!STATE.lastError || STATE.lastError !== e.message) {
             log(`Inference error: ${e.message}`, 'error');
-            console.error(e);
             STATE.lastError = e.message;
         }
     }
@@ -586,15 +642,17 @@ function triggerWakeWord() {
     if (!STATE.isListening) {
         STATE.isListening = true;
         
+        // Vibration Feedback
+        if (navigator.vibrate) {
+            navigator.vibrate(200);
+        }
+        
         // Play Feedback Sound (Beep)
         playWakeSound();
         
         updateUI();
         
-        // Clear inference buffers to prevent "echo" re-detection -- REMOVED
-        // We now rely on continuous background processing to flush old data naturally
-        
-        // Reset audio scheduling (stop previous TTS if any)
+        // Reset audio scheduling
         if (STATE.audioContext) {
             STATE.nextAudioTime = STATE.audioContext.currentTime;
         }
@@ -608,18 +666,18 @@ function triggerWakeWord() {
         }
         
         // Stop listening after 15 seconds (Safety timeout)
+        if (STATE.silenceTimer) clearTimeout(STATE.silenceTimer);
         STATE.silenceTimer = setTimeout(() => {
             if (STATE.isListening) {
                 STATE.isListening = false;
                 updateUI();
                 log('Listening timeout', 'info');
                 
-                // Notify server to stop recording
                 if (STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
                     STATE.ws.send(JSON.stringify({ type: 'stop' }));
                 }
                 
-                // Reset buffers to avoid state pollution from the gap
+                // Reset buffers
                 STATE.buffers.mel = [];
                 STATE.buffers.emb = new Array(16).fill(0).map(() => new Float32Array(96).fill(0));
             }
@@ -628,52 +686,40 @@ function triggerWakeWord() {
 }
 
 /**
- * Load wake word model (placeholder)
- */
-/**
  * Load wake word models
  */
 async function loadWakeWordModel() {
     try {
         log('Loading ONNX models...', 'info');
+        if (window.showToast) window.showToast('Loading models...', 'info');
         
         const modelPath = 'models';
         const wakeWordId = CONFIG.wakeWord;
         
         // Load Melspectrogram model
-        log('Loading melspectrogram model...', 'info');
         STATE.onnxSessions.mel = await ort.InferenceSession.create(`${modelPath}/melspectrogram.onnx`, { executionProviders: ['wasm'] });
         
         // Load Embedding model
-        log('Loading embedding model...', 'info');
         STATE.onnxSessions.embedding = await ort.InferenceSession.create(`${modelPath}/embedding_model.onnx`, { executionProviders: ['wasm'] });
         
         // Load Wake Word model
-        log(`Loading wake word model: ${wakeWordId}...`, 'info');
         STATE.onnxSessions.wakeWord = await ort.InferenceSession.create(`${modelPath}/${wakeWordId}.onnx`, { executionProviders: ['wasm'] });
         
         // Reset buffers
         STATE.buffers.mel = [];
-        // Initialize embedding buffer with zero-filled arrays to match input shape [96]
         STATE.buffers.emb = new Array(16).fill(0).map(() => new Float32Array(96).fill(0));
         STATE.lastError = null;
 
         log(`Models loaded successfully`, 'success');
+        if (window.showToast) window.showToast('Voice models ready', 'success');
         
     } catch (error) {
         log(`Failed to load models: ${error.message}`, 'error');
+        if (window.showToast) window.showToast('Failed to load models', 'error');
         throw error;
     }
 }
 
-/**
- * Simulate wake word detection (for testing)
- */
-
-
-/**
- * Play audio response from server
- */
 /**
  * Play audio response from server (Raw PCM)
  */
@@ -683,58 +729,42 @@ async function playAudioResponse(arrayBuffer) {
              console.warn('AudioContext lost but state is active. Re-initializing...');
              await initAudioContext();
         } else {
-             // Ignore audio if not active
              return;
         }
     }
 
     try {
-        // Detect and skip WAV header (RIFF) to avoid static burst
-        // RIFF = 0x52 0x49 0x46 0x46
+        // Detect and skip WAV header (RIFF)
         if (arrayBuffer.byteLength > 44) {
             const headerView = new DataView(arrayBuffer);
             if (headerView.getUint32(0, false) === 0x52494646) {
-                log('Detected WAV header in stream. Skipping 44 bytes.', 'warning');
                 arrayBuffer = arrayBuffer.slice(44);
             }
         }
 
-        // Assume 16-bit Mono PCM, 16000Hz (Wyoming standard for Rhasspy)
-        // If TTS is 22050Hz, we might need to adjust or read metadata
         const int16Data = new Int16Array(arrayBuffer);
         const float32Data = new Float32Array(int16Data.length);
         
-        // Convert Int16 to Float32
         for (let i = 0; i < int16Data.length; i++) {
             float32Data[i] = int16Data[i] / 32768.0;
         }
         
-        // Create AudioBuffer
-        const rate = STATE.currentTtsRate || CONFIG.ttsSampleRate || 22050; // Use detected rate or fallback
+        const rate = STATE.currentTtsRate || CONFIG.ttsSampleRate || 22050; 
         const buffer = STATE.audioContext.createBuffer(1, float32Data.length, rate);
         buffer.getChannelData(0).set(float32Data);
         
-        // Schedule playback
         const source = STATE.audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(STATE.audioContext.destination);
         
-        // Ensure continuous playback
         const currentTime = STATE.audioContext.currentTime;
-        
-        // If nextAudioTime is in the past (lag), reset it
         if (!STATE.nextAudioTime || STATE.nextAudioTime < currentTime) {
            STATE.nextAudioTime = currentTime;
         }
         
-        // If nextAudioTime is too far in the future, it usually means we have a long queue.
-        // We trust the config_audio reset to handle true drift.
-        // Removing the aggressive 5s reset to allow long TTS messages.
-        
         source.start(STATE.nextAudioTime);
         STATE.nextAudioTime += buffer.duration;
         
-        // log('Playing TTS chunk', 'info'); // Too noisy
     } catch (error) {
         log(`Failed to play audio: ${error.message}`, 'error');
     }
@@ -746,12 +776,10 @@ async function playAudioResponse(arrayBuffer) {
 function updateUI() {
     if (STATE.isListening) {
         if (elements.micVisualizer) {
-            elements.micVisualizer.classList.remove('active');
             elements.micVisualizer.classList.add('listening');
         }
         if (elements.stateText) {
             elements.stateText.textContent = 'Listening...';
-            elements.stateText.className = 'state-text listening';
         }
         if (elements.activateFab) {
             elements.activateFab.classList.add('listening');
@@ -764,8 +792,7 @@ function updateUI() {
             elements.micVisualizer.classList.remove('listening');
         }
         if (elements.stateText) {
-            elements.stateText.textContent = 'Ready (Press SPACE)';
-            elements.stateText.className = 'state-text active';
+            elements.stateText.textContent = 'Ready';
         }
         if (elements.activateFab) {
             elements.activateFab.classList.remove('listening');
@@ -779,7 +806,6 @@ function updateUI() {
         }
         if (elements.stateText) {
             elements.stateText.textContent = 'Click to activate';
-            elements.stateText.className = 'state-text';
         }
         if (elements.activateFab) {
             elements.activateFab.classList.remove('active', 'listening');
@@ -788,9 +814,6 @@ function updateUI() {
     }
 }
 
-/**
- * Update status badge
- */
 function updateStatus(elementId, status, text) {
     const element = document.getElementById(elementId);
     if (element) {
@@ -817,8 +840,6 @@ function toggleSettings() {
 function saveSettings() {
     CONFIG.wsUrl = elements.wsUrlInput.value;
     CONFIG.wakeWord = elements.wakeWordSelect.value;
-    CONFIG.wsUrl = elements.wsUrlInput.value;
-    CONFIG.wakeWord = elements.wakeWordSelect.value;
     CONFIG.authToken = elements.authTokenInput.value;
     if (elements.overlayUrlInput) CONFIG.overlayUrl = elements.overlayUrlInput.value;
     
@@ -838,6 +859,7 @@ function saveSettings() {
     }
     
     log('Settings saved', 'success');
+    if (window.showToast) window.showToast('Settings saved', 'success');
     toggleSettings();
 }
 
@@ -847,7 +869,6 @@ function saveSettings() {
 function log(message, type = 'info') {
     console.log(`[${type.toUpperCase()}] ${message}`);
 
-    // Optimization: Don't update DOM if log is hidden, unless it's an error
     if (elements.debugLog.classList.contains('hidden') && type !== 'error') {
         return;
     }
@@ -857,53 +878,26 @@ function log(message, type = 'info') {
     entry.className = 'log-entry';
     entry.innerHTML = `<span class="log-time">${time}</span><span class="log-${type}">${message}</span>`;
     
-    // Limit log size to 100 entries to prevent memory leaks
-    if (elements.debugLog.children.length > 100) {
+    if (elements.debugLog.children.length > 50) {
         elements.debugLog.removeChild(elements.debugLog.firstChild);
     }
 
     elements.debugLog.appendChild(entry);
-    
-    // Defer layout/scroll to next frame to avoid blocking main thread
     requestAnimationFrame(() => {
         elements.debugLog.scrollTop = elements.debugLog.scrollHeight;
     });
 }
 
-/**
- * Clear debug log
- */
 function clearLog() {
     elements.debugLog.innerHTML = '';
-    log('Log cleared', 'info');
 }
-
-/**
- * Send periodic keep-alive ping
- */
-function startKeepAlive() {
-    setInterval(() => {
-        if (STATE.ws && STATE.ws.readyState === WebSocket.OPEN) {
-            STATE.ws.send(JSON.stringify({ type: 'ping' }));
-        }
-    }, 30000); // Every 30 seconds
-}
-
-// Initialize on page load
-document.addEventListener('DOMContentLoaded', () => {
-    init();
-    startKeepAlive();
-});
 
 // PWA Install Prompt
 let deferredPrompt;
 
 window.addEventListener('beforeinstallprompt', (e) => {
-    // Prevent Chrome 67 and earlier from automatically showing the prompt
     e.preventDefault();
-    // Stash the event so it can be triggered later.
     deferredPrompt = e;
-    // Update UI to notify the user they can add to home screen
     if (elements.installBtn) {
         elements.installBtn.style.display = 'inline-flex';
         elements.installBtn.classList.remove('hidden');
@@ -913,13 +907,9 @@ window.addEventListener('beforeinstallprompt', (e) => {
 
 async function installPWA() {
     if (!deferredPrompt) return;
-    // Show the prompt
     deferredPrompt.prompt();
-    // Wait for the user to respond to the prompt
     const { outcome } = await deferredPrompt.userChoice;
-    // Optionally, send analytics event with outcome of user choice
     log(`User response to install prompt: ${outcome}`, 'info');
-    // We've used the prompt, and can't use it again, throw it away
     deferredPrompt = null;
     if (elements.installBtn) {
        elements.installBtn.style.display = 'none';
@@ -928,9 +918,12 @@ async function installPWA() {
 
 // Handle page unload
 window.addEventListener('beforeunload', () => {
-    deactivate();
+    // Only deactivate if we really need to, otherwise let session persist
+    // But audio context usually needs cleanup.
 });
 
+// Init
+document.addEventListener('DOMContentLoaded', init);
 
 /**
  * Play a short beep sound for wake word confirmation
@@ -958,24 +951,3 @@ function playWakeSound() {
         console.error('Error playing wake sound:', e);
     }
 }
-
-/**
- * Toggle debug log visibility
- */
-function toggleDebugLog() {
-    const logContainer = document.getElementById('debug-log');
-    const icon = document.getElementById('debug-toggle-icon');
-    
-    if (logContainer.classList.contains('hidden')) {
-        logContainer.classList.remove('hidden');
-        icon.textContent = '▲';
-        // Auto scroll to bottom when opening
-        logContainer.scrollTop = logContainer.scrollHeight;
-    } else {
-        logContainer.classList.add('hidden');
-        icon.textContent = '▼';
-    }
-}
-
-// Make sure it's available globally needed for onclick
-window.toggleDebugLog = toggleDebugLog;
