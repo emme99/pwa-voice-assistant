@@ -567,7 +567,14 @@ async function runWakeWordInference(float32Data) {
     try {
         // --- 1. Melspectrogram ---
         const melInputName = STATE.onnxSessions.mel.inputNames[0];
-        const audioTensor = new ort.Tensor('float32', Float32Array.from(float32Data), [1, float32Data.length]);
+        
+        // Scale audio to Int16 range for the model (typical for openWakeWord)
+        const scaledAudio = new Float32Array(float32Data.length);
+        for (let i = 0; i < float32Data.length; i++) {
+            scaledAudio[i] = float32Data[i] * 32768.0;
+        }
+        
+        const audioTensor = new ort.Tensor('float32', scaledAudio, [1, float32Data.length]);
         
         const melResults = await STATE.onnxSessions.mel.run({ [melInputName]: audioTensor });
         let melOutput = melResults[STATE.onnxSessions.mel.outputNames[0]].data;
@@ -620,6 +627,11 @@ async function runWakeWordInference(float32Data) {
              
              const wwResults = await item.run({ [wwInputName]: embTensor });
              const probability = wwResults[item.outputNames[0]].data[0];
+             
+             // Debug logging
+             if (probability > 0.01) {
+                 console.log(`WW Prob: ${probability.toFixed(3)}`);
+             }
              
              if (probability > 0.5) {
                   log(`Wake word detected! (${(probability * 100).toFixed(1)}%)`, 'success');
