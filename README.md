@@ -107,4 +107,44 @@ To prevent the app from sleeping in the background (which stops wake word detect
     - If on Android, check **Battery Optimization** settings above.
     - Check the **Debug Log** (toggle in settings overlay) for errors.
     - Ensure the WebSocket server is running.
+  
+  
+## Limitations and Possible Solutions
 
+### Overview
+This project leverages a Progressive Web App (PWA) for a zero-hardware voice assistant integrated with Home Assistant via Wyoming. While innovative and privacy-focused, it has inherent limitations due to browser and Android constraints, particularly with always-on wake word (WW) detection. Below is a summary of key limitations and recommended solutions, based on analysis of stability issues (e.g., initial detection works but fails over time) and alternatives for improved reliability.
+
+### Key Limitations
+- **Wake Word Detection Instability**: Initial detections are reliable, but the system often fails after a few minutes due to browser hibernation, background throttling on Android/Chrome, microphone permission revocation, or resource overload from ONNX/WASM processing. This is not a code bug but a platform limitation—Android prioritizes battery saving, suspending JS/WASM loops and audio access in background tabs.
+- **Background Execution Challenges**: PWAs struggle with continuous listening when the app is minimized or the screen is off, leading to dropped connections or frozen detection. This makes it less suitable for "always-on" use compared to dedicated hardware.
+- **Browser Dependencies**: Relies on HTTPS for microphone access, with potential WebSocket disconnects and no native-level control over permissions or resources. Performance may degrade on low-end tablets.
+- **Project Maturity**: As an early-stage project (limited commits), it lacks advanced features like multi-WW support or robust error handling, though rapid iterations are ongoing.
+
+### Possible Solutions
+- **Optimize PWA for Stability**:
+  - Disable battery optimization for Chrome on Android (Settings > Apps > Chrome > Battery > Unrestricted) to reduce throttling.
+  - Keep the PWA in foreground or with the screen always on for testing/production use.
+  - Implement WebSocket reconnect with exponential backoff, visibility change handlers (e.g., pause/resume on `visibilitychange`), and detailed client-side logging for debugging.
+  - Use remote DevTools (chrome://inspect) to monitor errors like "AudioContext suspended" or WebSocket issues.
+
+- **Switch to Kiosk Mode Apps (Recommended for Quick Wins)**:
+  - Adopt apps like **Fully Kiosk Browser** (free trial, ~€10-20 for Plus features) to load your PWA URL (e.g., https://your-pi:8765/overlay.html). It enables persistent microphone access, ignores battery optimizations, and supports kiosk features like fullscreen lock, hidden bars, and acoustic motion detection.
+    - Setup: Install from Play Store, set start URL, enable microphone (Plus), and configure device management for keep-alive.
+  - Alternatives: **WallPanel** (open-source, free with motion/face detection) or enterprise MDM like Scalefusion/Hexnode for similar benefits.
+  - Benefits: Resolves most instability without code changes; ideal for wall-mounted tablets and easy sharing with non-technical users.
+
+- **Develop a Custom Android App with WebView**:
+  - For maximum control, build a simple APK using Android Studio (Kotlin/Java) that embeds a WebView to load your PWA.
+  - Add a Foreground Service with partial wake locks and persistent mic permissions to ensure always-on detection.
+  - Integrate native WW libraries like Picovoice/Porcupine for better stability (replacing WASM).
+  - Drawbacks: More development effort and sideload distribution (not Play Store-friendly), but lightweight (~10-30MB bundle).
+
+- **Hardware or Hybrid Alternatives**:
+  - For production reliability, consider dedicated satellites (e.g., ESP32-S3, ReSpeaker) with Wyoming, or hybrid setups (PWA for UI + hardware for audio).
+  - Document these in your README and continue testing foreground stability— if resolved with optimizations, the PWA remains viable for personal use.
+
+This approach balances accessibility with reliability. For contributions or issues, check the repository for updates.
+
+**AI Assistance Disclaimer**: Parts of this code were generated or assisted
+by AI models (including Grok by xAI). All code has been manually reviewed
+and tested.
